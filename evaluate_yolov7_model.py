@@ -38,11 +38,14 @@ CAT_TO_COLOUR = {
 }
 
 # Parameters
-MIN_CONE_HEIGHT = 25
+MIN_CONE_WIDTH = 5
+MIN_CONE_HEIGHT = 10
+CONFIDENCE_THRESHOLD = 0.25
+MAP_THRESHOLDS = np.linspace(1.5, 0.1, 20)
 METRIC_THRESHOLDS = [0.1, 0.5, 1, 3]
 LATENCY_TEST_REPETITIONS = 1000
 
-CONE_IMAGE_MARGIN = 3
+CONE_IMAGE_MARGIN = 5
 IMAGE_SIZE = (128, 96)
 image_encoding = T.Resize((int(IMAGE_SIZE[0]), int(IMAGE_SIZE[1])))
 device = torch.device("cuda")
@@ -84,7 +87,7 @@ def main(yolo_model_path, artifact_id, new_run):
     artifact_dir = artifact.download()
     checkpoint_path = Path(artifact_dir) / "model.ckpt"
     kp_model = load_from_checkpoint(checkpoint_path)
-    detector = Yolov7Detector(yolo_model_path)
+    detector = Yolov7Detector(yolo_model_path, conf=1e-3)
     
     if new_run:
         run.finish()
@@ -108,13 +111,15 @@ def main(yolo_model_path, artifact_id, new_run):
             ann_by_image_id[annot["image_id"]].append(annot)
 
     # Predict the data
-    global_predictions, global_gt = [], []
+    global_predictions, global_gt, global_conf = [], [], []
     prediction_times = []
     image_ids = []
 
     print_green("Predicting test set cones")
     # Form predictions for the entire dataset
     for image_obj in tqdm(dataset["images"], desc="Predicting cone locations"):
+        cone_confidences = []
+        
         # Load in the image
         original_image = (
             read_image(str(dataset_path.parent / image_obj["file_name"])).float() / 255
@@ -131,10 +136,17 @@ def main(yolo_model_path, artifact_id, new_run):
         predictions = np.empty((0, 4))
         for detection in detections:
             category = int(detection[-1])
+            cone_confidence = detection[-2]
             bbox_kpts = [round(x) for x in detection[:4]]
             bbox_kpts[0] = max(0, bbox_kpts[0] - CONE_IMAGE_MARGIN)
             bbox_kpts[1] = max(0, bbox_kpts[1] - CONE_IMAGE_MARGIN)
             
+            if (
+                bbox_kpts[2] - bbox_kpts[0] < MIN_CONE_WIDTH
+                or bbox_kpts[3] - bbox_kpts[1] < MIN_CONE_HEIGHT
+            ):
+                continue
+
             vis_img = cv2.rectangle(vis_img, bbox_kpts[:2], bbox_kpts[2:], CAT_TO_COLOUR[category], 2)
 
             cone_img = original_image[
@@ -200,6 +212,7 @@ def main(yolo_model_path, artifact_id, new_run):
             )[0].numpy()
             cone = np.array([category, *cone_pos])
             predictions = np.vstack((predictions, cone))
+            cone_confidences.append(cone_confidence)
 
             toc = time.perf_counter()
             prediction_times[-1] += toc - tic
@@ -218,17 +231,35 @@ def main(yolo_model_path, artifact_id, new_run):
 
         global_predictions.append(predictions)
         global_gt.append(gt)
+        global_conf.append(cone_confidences)
         
         vis_img = cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB)
         wandb.log({f"[{image_obj['id']}] Detections": wandb.Image(vis_img)})
 
     print_green("Calculate metrics")
+    mAP_score = matching_score(
+        global_gt, global_predictions, global_conf, MAP_THRESHOLDS
+    )
+
+    # Apply confidence threshold
+    for i in range(len(global_gt)):
+        global_conf[i] = np.array(global_conf[i])
+
+        # Check whether the predictions are empty
+        if not np.any(global_conf[i] >= CONFIDENCE_THRESHOLD):
+            global_predictions[i] = None
+        else:
+            global_predictions[i] = global_predictions[i][
+                global_conf[i] >= CONFIDENCE_THRESHOLD, ...
+            ]
+
+        global_conf[i] = global_conf[i][global_conf[i] >= CONFIDENCE_THRESHOLD, ...]
+
     columns = []
     for threshold in METRIC_THRESHOLDS:
         columns += [
             f"lucas_{threshold}",
             f"colour_{threshold}",
-            f"matching_{threshold}",
             f"pos_2d_{threshold}",
             f"pos_3d_{threshold}",
         ]
@@ -260,12 +291,6 @@ def main(yolo_model_path, artifact_id, new_run):
                 pred_to_gt,
                 gt_fn,
             )
-            m_score = matching_score(
-                global_gt[i],
-                global_predictions[i],
-                pred_to_gt,
-                gt_fn,
-            )
             score_2d, score_3d = pos_score(
                 global_gt[i], global_predictions[i], pred_to_gt, gt_fn
             )
@@ -273,24 +298,13 @@ def main(yolo_model_path, artifact_id, new_run):
                 fig = generate_plot(
                     global_predictions[i],
                     global_gt[i],
-                    f"[{image_ids[i]}] Lucas score 0.5: {round(l_score)}/{l2_score:.2f} ({c_score:.2f}, {m_score:.2f}, {score_2d:.2f})",
+                    f"[{image_ids[i]}] Lucas score 0.5: {round(l_score)}/{l2_score:.2f} ({c_score:.2f}, {score_2d:.2f})",
                 )
                 wandb.log({f"lucas_score_0.5_{i}": wandb.Image(fig)})
 
             entry += [
                 l_score,
-                colour_score(
-                    global_gt[i],
-                    global_predictions[i],
-                    pred_to_gt,
-                    gt_fn,
-                ),
-                matching_score(
-                    global_gt[i],
-                    global_predictions[i],
-                    pred_to_gt,
-                    gt_fn,
-                ),
+                c_score,
                 score_2d,
                 score_3d,
             ]
@@ -298,6 +312,7 @@ def main(yolo_model_path, artifact_id, new_run):
         df.loc[len(df)] = entry
     print("Median scores:")
     print(df.median())
+    print("mAP: ", mAP_score)
 
     # Log metrics
     table = wandb.Table(data=df, columns=columns)
@@ -314,6 +329,9 @@ def main(yolo_model_path, artifact_id, new_run):
 
     for col_name in columns:
         wandb.run.summary[f"test/metrics/median_{col_name}"] = df[col_name].median()
+
+    # mAP
+    wandb.run.summary[f"test/metrics/mAP"] = mAP_score
 
     # Finally perform a speed test
     print_green("Latency check")

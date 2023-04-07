@@ -17,7 +17,7 @@ from utils.torch_utils import select_device, load_classifier, time_synchronized,
 
 
 class Yolov7Detector():
-    def __init__(self, weights, imgsz=640):
+    def __init__(self, weights, imgsz=640, conf=0.25):
         # Initialize
         self.device = select_device('0')
         self.half = self.device.type != 'cpu'  # half precision only supported on CUDA
@@ -30,7 +30,7 @@ class Yolov7Detector():
         if self.half:
             self.model.half()  # to FP16
         
-        self.conf_thres = 0.25
+        self.conf_thres = conf
         self.iou_thres = 0.45
         self.agnostic_nms = False
         
@@ -76,24 +76,23 @@ class Yolov7Detector():
         t2 = time_synchronized()
 
         # Apply NMS
-        pred = non_max_suppression(pred, self.conf_thres, self.iou_thres, classes=self.classes, agnostic=self.agnostic_nms)
+        pred = non_max_suppression(pred, self.conf_thres, self.iou_thres, classes=self.classes, agnostic=self.agnostic_nms)[0]  # There is only one image
         t3 = time_synchronized()
         
         s = ''
         
         # Process detections
-        for i, det in enumerate(pred):  # detections per image
-            gn = torch.tensor(original_shape)[[1, 0, 1, 0]]  # normalization gain whwh
-            if len(det):
-                # Rescale boxes from img_size to original size
-                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], original_shape).round()
+        gn = torch.tensor(original_shape)[[1, 0, 1, 0]]  # normalization gain whwh
+        if len(pred):
+            # Rescale boxes from img_size to original size
+            pred[:, :4] = scale_coords(img.shape[2:], pred[:, :4], original_shape).round()
 
-                # Print results
-                for c in det[:, -1].unique():
-                    n = (det[:, -1] == c).sum()  # detections per class
-                    s += f"{n} {self.names[int(c)]}{'s' * (n > 1)}, "  # add to string
+            # Print results
+            for c in pred[:, -1].unique():
+                n = (pred[:, -1] == c).sum()  # detections per class
+                s += f"{n} {self.names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
-            # Print time (inference + NMS)
-            print(f'{s}Done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, ({(1E3 * (t3 - t2)):.1f}ms) NMS')
+        # Print time (inference + NMS)
+        print(f'{s}Done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, ({(1E3 * (t3 - t2)):.1f}ms) NMS')
 
-        return time.time() - t0, det.cpu().detach().numpy()
+        return time.time() - t0, pred.cpu().detach().numpy()

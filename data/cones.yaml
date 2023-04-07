@@ -1,0 +1,9 @@
+train: /project_ghent/thesis/train_set_synth/images/
+val: /project_ghent/thesis/val_set_synth/images/
+test: /project_ghent/thesis/test_set_synth/images/
+
+# number of classes
+nc: 4
+
+# class names
+names: [ 'blue_cone', 'yellow_cone', 'orange_cone_big', 'orange_cone_small' ]
